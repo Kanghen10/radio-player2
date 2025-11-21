@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Radio Player</title>
+  <style>
+    html, body {
+      margin: 0; padding: 0;
+      width: 100%; height: 100%;
+      background: #000; overflow: hidden;
+      display:flex; flex-direction:column; align-items:center; justify-content:center;
+      color:#fff; font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial;
+    }
+    #background { position:fixed; inset:0; background:#000; background-size:cover; background-position:center; opacity:0.18; z-index:0; }
+    #cover { max-width:80%; max-height:45%; object-fit:cover; border-radius:10px; margin-bottom:12px; background:#000; display:none; z-index:1; }
+    .controls { display:flex; gap:12px; z-index:2; }
+    button { padding:8px 18px; font-size:14px; font-weight:600; border:none; border-radius:6px; cursor:pointer; background:#1a73e8; color:#fff; }
+    button.stop { background:#d93025; }
+    audio { display:none; }
+    #msg { position:fixed; bottom:12px; left:12px; z-index:3; color:#ddd; font-size:12px; background:rgba(0,0,0,0.4); padding:6px 8px; border-radius:6px; }
+    code { color:#9ad1ff; background:rgba(255,255,255,0.03); padding:2px 4px; border-radius:4px; }
+
+    /* 🎧 Tambahan Visualizer */
+    #visualizer {
+      width: 100%;
+      height: 200px;
+      position: relative;
+      z-index: 2;
+    }
+    #modeToggle {
+      position: fixed;
+      top: 10px;
+      right: 10px;
+      background: rgba(0,0,0,0.5);
+      font-size: 14px;
+      color: white;
+      padding: 6px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      z-index: 5;
+    }
+  </style>
+</head>
+<body>
+
+  <div id="background"></div>
+  <img id="cover" alt="Cover">
+
+  <!-- 🎧 Canvas Visualizer -->
+  <canvas id="visualizer"></canvas>
+  <button id="modeToggle">Mode: Bar</button>
+
+  <div class="controls">
+    <button id="playBtn">PLAY</button>
+    <button id="stopBtn" class="stop">STOP</button>
+  </div>
+
+  <audio id="player" autoplay playsinline muted crossorigin="anonymous"></audio>
+
+  <div id="msg">Memuat... (tambahkan stream setelah tanda <code>#</code>)</div>
+
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <script>
+  (function(){
+    let PROXY_BASE = null;
+    const CORS_FALLBACK = "https://api.allorigins.win/raw?url=";
+
+    const audio = document.getElementById('player');
+    const playBtn = document.getElementById('playBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const cover = document.getElementById('cover');
+    const msg = document.getElementById('msg');
+    const background = document.getElementById('background');
+
+    const rawHash = decodeURIComponent(location.hash.substring(1) || '').trim();
+    if (rawHash.startsWith('proxy=')) {
+      const idx = rawHash.indexOf('|');
+      if (idx > -1) {
+        const p = rawHash.substring(6, idx);
+        const s = rawHash.substring(idx+1);
+        if (p) PROXY_BASE = p;
+        window._RAW_STREAM = s;
+      } else {
+        window._RAW_STREAM = rawHash.substring(6);
+      }
+    } else {
+      window._RAW_STREAM = rawHash;
+    }
+
+    let hlsInstance = null;
+    let currentFinalUrl = null;
+    let isStopped = false;
+    let lastResolvedPlaylist = null;
+
+    // 🆕 Wake Lock Handler
+    let wakeLock = null;
+    async function requestWakeLock() {
+      try {
+        if ('wakeLock' in navigator) {
+          wakeLock = await navigator.wakeLock.request('screen');
+          wakeLock.addEventListener('release', () => {
+            console.log('Wake Lock released');
+          });
+          console.log('Wake Lock active');
+        }
+      } catch (err) {
+        console.warn('Wake Lock not available:', err);
+      }
+    }
+    function releaseWakeLock() {
+      if (wakeLock) {
+        wakeLock.release().catch(()=>{});
+        wakeLock = null;
+      }
+    }
+
+    function setMsg(t){ msg.innerHTML = t; }
+    function extOf(u){
+      try { return (new URL(u)).pathname.split('.').pop().toLowerCase(); } catch(e){ return u.split('.').pop().toLowerCase(); }
+    }
+
+    async function fetchTextWithFallback(url){
+      try {
+        const r = await fetch(url);
+        if (r.ok) return await r.text();
+        throw new Error('non-ok');
+      } catch (err) {
+        try {
+          const r2 = await fetch(CORS_FALLBACK + encodeURIComponent(url));
+          if (r2.ok) return await r2.text();
+        } catch (e2) {}
+        return null;
+      }
+    }
+
+    function parseM3U(text, baseUrl){
+      const lines = text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+      for (const l of lines){
+        if (l.startsWith('#')) continue;
+        if (l.startsWith('http')) return l;
+        if (baseUrl) {
+          try { return (new URL(l, baseUrl)).href; } catch(e){}
+        }
+      }
+      return null;
+    }
+    function parsePLS(text){
+      const lines = text.split(/\r?\n/);
+      for (const l of lines){
+        if (/^File\d+=/i.test(l)){
+          const v = l.split('=')[1].trim();
+          if (v) return v;
+        }
+      }
+      return null;
+    }
+
+    async function tryResolvePlaylist(url){
+      const ext = extOf(url || '');
+      if (ext === 'm3u8') return url;
+      if (!(ext === 'm3u' || ext === 'pls' || (url && (url.includes('.m3u') || url.includes('.pls'))))) return null;
+      setMsg('Mendeteksi playlist...');
+      const txt = await fetchTextWithFallback(url);
+      if (!txt) return null;
+      if (ext === 'pls' || txt.toLowerCase().includes('[playlist]')) {
+        return parsePLS(txt) || null;
+      } else {
+        return parseM3U(txt, url) || null;
+      }
+    }
+
+    function buildProxyUrl(u){
+      if (!PROXY_BASE) return u;
+      if (PROXY_BASE.endsWith('=')) return PROXY_BASE + encodeURIComponent(u);
+      if (PROXY_BASE.indexOf('?') === -1) {
+        return PROXY_BASE.replace(/\/$/, '') + '/?url=' + encodeURIComponent(u);
+      }
+      return PROXY_BASE + encodeURIComponent(u);
+    }
+
+    async function attemptGetCover(streamUrl){
+      try {
+        const origin = (new URL(streamUrl)).origin;
+        const sj = await fetchTextWithFallback(origin + '/status-json.xsl');
+        if (sj) {
+          const j = JSON.parse(sj);
+          const sources = j.icestats && j.icestats.source
+            ? (Array.isArray(j.icestats.source) ? j.icestats.source : [j.icestats.source])
+            : null;
+          if (sources && sources.length){
+            let s0 = sources.find(s => (s.listenurl && s.listenurl === streamUrl) || (s.file && streamUrl.includes(s.file))) || sources[0];
+            const image = s0 && (s0.image || (s0.server_name && s0.server_name.image)) ? (s0.image || s0.server_name.image) : null;
+            if (image) return image;
+          }
+        }
+        const html = await fetchTextWithFallback(origin);
+        if (html) {
+          const m = html.match(/<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']+)["']/i)
+                || html.match(/<meta[^>]*name=["']twitter:image["'][^>]*content=["']([^"']+)["']/i)
+                || html.match(/<link[^>]*rel=["']image_src["'][^>]*href=["']([^"']+)["']/i);
+          if (m) {
+            try { return (new URL(m[1], origin)).href; }
+            catch(e) { return m[1]; }
+          }
+        }
+      } catch(e){}
+      return null;
+    }
+
+    function cleanupResources(){
+      if (hlsInstance) {
+        try { hlsInstance.destroy(); } catch(e){ }
+        hlsInstance = null;
+      }
+      try { audio.pause(); } catch(e){}
+      try {
+        audio.removeAttribute('src');
+        audio.load();
+      } catch(e){}
+      currentFinalUrl = null;
+      stopVisualizer(); // 🎧 stop visualizer
+      releaseWakeLock();
+    }
+
+    function stopRadio(){
+      isStopped = true;
+      cleanupResources();
+      cover.style.display = 'none';
+      background.style.backgroundImage = '';
+      setMsg('Streaming dihentikan. Tekan PLAY untuk mulai ulang.');
+    }
+
+    async function initAndPlay(){
+      if (!window._RAW_STREAM) {
+        setMsg('❌ Tidak ada URL stream pada hash.');
+        return;
+      }
+      isStopped = false;
+      setMsg('Memproses URL...');
+      try {
+        let resolved = await tryResolvePlaylist(window._RAW_STREAM);
+        currentFinalUrl = resolved || window._RAW_STREAM;
+      } catch(e){
+        currentFinalUrl = window._RAW_STREAM;
+      }
+
+      attemptGetCover(currentFinalUrl).then(img=>{
+        if (img){
+          cover.src = img;
+          cover.style.display = 'block';
+          background.style.backgroundImage = `url("${img}")`;
+        } else {
+          cover.style.display = 'none';
+          background.style.backgroundImage = '';
+        }
+      });
+
+      const ext = extOf(currentFinalUrl || '');
+      if (ext === 'm3u8') {
+        if (window.Hls && Hls.isSupported()){
+          if (hlsInstance) { try{ hlsInstance.destroy(); } catch(e){} hlsInstance = null; }
+          hlsInstance = new Hls();
+          hlsInstance.loadSource(buildProxyUrl(currentFinalUrl));
+          hlsInstance.attachMedia(audio);
+          hlsInstance.on(Hls.Events.MANIFEST_PARSED, ()=>{
+            audio.play().then(()=>{ audio.muted = false; setMsg('Sedang memutar...'); requestWakeLock(); startVisualizer(); }).catch(()=>{ setMsg('Untuk memutar, tekan PLAY'); });
+          });
+        } else if (audio.canPlayType('application/vnd.apple.mpegurl')) {
+          audio.src = buildProxyUrl(currentFinalUrl);
+          audio.play().then(()=>{ audio.muted = false; setMsg('Sedang memutar...'); requestWakeLock(); startVisualizer(); }).catch(()=> setMsg('Autoplay diblokir, tekan PLAY'));
+        } else {
+          setMsg('Browser tidak mendukung HLS.');
+        }
+      } else {
+        audio.src = buildProxyUrl(currentFinalUrl);
+        audio.load();
+        audio.play().then(()=>{
+          audio.muted = false;
+          setMsg('Sedang memutar...');
+          requestWakeLock();
+          startVisualizer(); // 🎧 mulai visualizer
+        }).catch(()=>{ setMsg('Untuk memutar, tekan PLAY'); });
+      }
+    }
+
+    function onAudioError(){ setMsg('❌ Gagal memutar stream.'); }
+    function onPlaying(){ setMsg('Sedang memutar...'); }
+
+    playBtn.addEventListener('click', async ()=>{
+      if (isStopped || !audio.src || !currentFinalUrl) {
+        await initAndPlay();
+      } else {
+        audio.play().then(()=>{ audio.muted = false; setMsg('Sedang memutar...'); requestWakeLock(); startVisualizer(); }).catch(()=>{ setMsg('Autoplay diblokir, tekan PLAY lagi'); });
+      }
+    });
+
+    stopBtn.addEventListener('click', stopRadio);
+
+    window.addEventListener('load', ()=>{
+      if (window._RAW_STREAM) { initAndPlay().catch(()=>{}); }
+      else setMsg('Tambahkan stream di hash, contoh: <code>#https://example.com/stream.mp3</code>');
+    });
+
+    document.addEventListener('visibilitychange', ()=>{
+      if (document.visibilityState === 'hidden' && !document.hiddenByScreenOff) {
+        stopRadio();
+      }
+    });
+
+    function stopPlaybackOnExit(){ cleanupResources(); }
+    window.addEventListener('beforeunload', stopPlaybackOnExit);
+    window.addEventListener('pagehide', stopPlaybackOnExit);
+    window.addEventListener('unload', stopPlaybackOnExit);
+
+    /* === 🎧 Visualizer Section (Bar / Wave / Circle + Glow) === */
+    const canvas = document.getElementById('visualizer');
+    const ctx = canvas.getContext('2d');
+    const modeToggle = document.getElementById('modeToggle');
+    const modes = ['bar', 'wave', 'circle'];
+    let modeIndex = 0;
+    let mode = modes[modeIndex];
+    let hue = 0;
+
+    let audioContext, source, analyser, dataArray, bufferLength, animationId;
+
+    function resizeCanvas() {
+      canvas.width = window.innerWidth;
+      canvas.height = 200;
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    function initAudioContext() {
+      if (!audioContext) {
+        try {
+          audioContext = new (window.AudioContext || window.webkitAudioContext)();
+          source = audioContext.createMediaElementSource(audio);
+          analyser = audioContext.createAnalyser();
+          analyser.fftSize = 2048;
+          bufferLength = analyser.frequencyBinCount;
+          dataArray = new Uint8Array(bufferLength);
+          source.connect(analyser);
+          analyser.connect(audioContext.destination);
+        } catch (e) {
+          console.warn('AudioContext init failed', e);
+        }
+      }
+    }
+
+    function drawVisualizer() {
+      animationId = requestAnimationFrame(drawVisualizer);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (!analyser) return;
+
+      if (mode === 'bar') {
+        analyser.getByteFrequencyData(dataArray);
+        const barWidth = (canvas.width / bufferLength) * 2.5;
+        let x = 0;
+        for (let i = 0; i < bufferLength; i++) {
+          const barHeight = dataArray[i] / 2;
+          ctx.fillStyle = 'rgb(' + (barHeight + 100) + ',50,50)';
+          ctx.fillRect(x, canvas.height - barHeight, barWidth, barHeight);
+          x += barWidth + 1;
+          if (x > canvas.width) break;
+        }
+      } else if (mode === 'wave') {
+        analyser.getByteTimeDomainData(dataArray);
+        ctx.beginPath();
+        const sliceWidth = canvas.width / bufferLength;
+        let x = 0;
+        for (let i = 0; i < bufferLength; i++) {
+          const v = dataArray[i] / 128.0;
+          const y = v * canvas.height / 2;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+          x += sliceWidth;
+        }
+        ctx.lineTo(canvas.width, canvas.height / 2);
+        ctx.strokeStyle = '#0f0';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      } else if (mode === 'circle') {
+        analyser.getByteTimeDomainData(dataArray);
+        const radius = 80;
+        const centerX = canvas.width / 2;
+        const centerY = canvas.height / 2;
+        ctx.beginPath();
+        for (let i = 0; i < bufferLength; i++) {
+          const angle = (i / bufferLength) * 2 * Math.PI;
+          const v = (dataArray[i] - 128) / 128.0;
+          const r = radius + v * 60;
+          const x = centerX + r * Math.cos(angle);
+          const y = centerY + r * Math.sin(angle);
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.closePath();
+        hue = (hue + 2) % 360;
+        const color = `hsl(${hue}, 100%, 60%)`;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 3;
+        ctx.shadowBlur = 25;
+        ctx.shadowColor = color;
+        ctx.stroke();
+        const gradient = ctx.createRadialGradient(centerX, centerY, radius*0.2, centerX, centerY, radius + 60);
+        gradient.addColorStop(0, `hsla(${hue},100%,60%,0.45)`);
+        gradient.addColorStop(1, `hsla(${(hue+60)%360},100%,50%,0.05)`);
+        ctx.fillStyle = gradient;
+        ctx.fill();
+        ctx.shadowBlur = 0;
+      }
+    }
+
+    function startVisualizer() {
+      initAudioContext();
+      stopVisualizer();
+      drawVisualizer();
+    }
+
+    function stopVisualizer() {
+      if (animationId) cancelAnimationFrame(animationId);
+      animationId = null;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+
+    modeToggle.addEventListener('click', () => {
+      modeIndex = (modeIndex + 1) % modes.length;
+      mode = modes[modeIndex];
+      modeToggle.textContent = 'Mode: ' + mode.charAt(0).toUpperCase() + mode.slice(1);
+    });
+
+  })();
+  </script>
+</body>
+</html>
